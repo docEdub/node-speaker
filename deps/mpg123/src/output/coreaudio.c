@@ -111,6 +111,141 @@ static OSStatus convertProc(void *inRefCon, AudioUnitRenderActionFlags *inAction
 	return err;
 }
 
+static void printOutputDevices() {
+    UInt32 dataSize;
+    AudioObjectPropertyAddress propertyAddress;
+    AudioDeviceID *deviceIDs = NULL;
+
+    // Get number of devices
+    propertyAddress = (AudioObjectPropertyAddress) {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMaster
+    };
+
+    AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &dataSize);
+
+    int deviceCount = dataSize / sizeof(AudioDeviceID);
+    deviceIDs = (AudioDeviceID *)malloc(dataSize);
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &dataSize, deviceIDs);
+
+    for (int i = 0; i < deviceCount; ++i) {
+        AudioDeviceID deviceID = deviceIDs[i];
+
+        // Check if device is an output device
+        propertyAddress = (AudioObjectPropertyAddress) {
+            kAudioDevicePropertyStreamConfiguration,
+            kAudioDevicePropertyScopeOutput,
+            kAudioObjectPropertyElementMaster
+        };
+
+        AudioBufferList bufferList;
+        dataSize = sizeof(bufferList);
+        if (AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, NULL, &dataSize, &bufferList) != noErr)
+            continue;
+
+        int outputChannels = 0;
+        for (UInt32 j = 0; j < bufferList.mNumberBuffers; ++j) {
+            outputChannels += bufferList.mBuffers[j].mNumberChannels;
+        }
+
+        if (outputChannels == 0)
+            continue;
+
+        // Get device name
+        CFStringRef deviceName = NULL;
+        dataSize = sizeof(deviceName);
+        propertyAddress.mSelector = kAudioObjectPropertyName;
+        propertyAddress.mScope = kAudioObjectPropertyScopeGlobal;
+
+        if (AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, NULL, &dataSize, &deviceName) == noErr && deviceName) {
+            char name[256];
+            CFStringGetCString(deviceName, name, sizeof(name), kCFStringEncodingUTF8);
+            fprintf(stderr, "    %s\n", name);
+            CFRelease(deviceName);
+        }
+    }
+
+    free(deviceIDs);
+}
+
+static AudioDeviceID findOutputDeviceByName(const char *targetName) {
+	// fprintf(stderr, "findOutputDeviceByName(%s);\n", targetName);
+
+	if (!targetName) {
+		return kAudioObjectUnknown;
+	}
+
+    AudioObjectPropertyAddress propertyAddress;
+    UInt32 dataSize;
+    AudioDeviceID *deviceIDs = NULL;
+
+    // Get list of all audio devices
+    propertyAddress = (AudioObjectPropertyAddress) {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMaster
+    };
+
+    AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &dataSize);
+    int deviceCount = dataSize / sizeof(AudioDeviceID);
+    deviceIDs = (AudioDeviceID *)malloc(dataSize);
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &dataSize, deviceIDs);
+
+    // Search for matching output device
+    for (int i = 0; i < deviceCount; ++i) {
+        AudioDeviceID deviceID = deviceIDs[i];
+
+        // Check if it's an output device
+        propertyAddress = (AudioObjectPropertyAddress) {
+            kAudioDevicePropertyStreamConfiguration,
+            kAudioDevicePropertyScopeOutput,
+            kAudioObjectPropertyElementMaster
+        };
+
+        AudioBufferList bufferList;
+        dataSize = sizeof(bufferList);
+        if (AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, NULL, &dataSize, &bufferList) != noErr)
+            continue;
+
+        int outputChannels = 0;
+        for (UInt32 j = 0; j < bufferList.mNumberBuffers; ++j)
+            outputChannels += bufferList.mBuffers[j].mNumberChannels;
+
+        if (outputChannels == 0)
+            continue;
+
+        // Get device name
+        CFStringRef deviceName = NULL;
+        dataSize = sizeof(deviceName);
+        propertyAddress = (AudioObjectPropertyAddress) {
+            kAudioObjectPropertyName,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMaster
+        };
+
+        if (AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, NULL, &dataSize, &deviceName) == noErr && deviceName) {
+            char name[256];
+            CFStringGetCString(deviceName, name, sizeof(name), kCFStringEncodingUTF8);
+            CFRelease(deviceName);
+
+            if (strcmp(name, targetName) == 0) {
+                free(deviceIDs);
+                return deviceID;
+            }
+        }
+    }
+
+    free(deviceIDs);
+
+	fprintf(stderr, "No output device found with name: \"%s\"\n", targetName);
+	fprintf(stderr, "Available output devices:\n");
+	printOutputDevices();
+	fprintf(stderr, "Using default output device.\n");
+
+    return kAudioObjectUnknown;
+}
+
 static int open_coreaudio(audio_output_t *ao)
 {
 	mpg123_coreaudio_t* ca = (mpg123_coreaudio_t*)ao->userptr;
@@ -130,14 +265,20 @@ static int open_coreaudio(audio_output_t *ao)
 	ca->play_done = 0;
 	ca->decode_done = 0;
 
+	AudioDeviceID deviceID = findOutputDeviceByName(ao->device);
 
 	/* Get the default audio output unit */
 	desc.componentType = kAudioUnitType_Output;
-	desc.componentSubType = kAudioUnitSubType_DefaultOutput;
-	desc.componentManufacturer = kAudioUnitManufacturer_Apple;
+	if (deviceID == kAudioObjectUnknown) {
+		desc.componentSubType = kAudioUnitSubType_DefaultOutput;
+	} else {
+		desc.componentSubType = kAudioUnitSubType_HALOutput;
+	}
+	desc.componentManufacturer = 0;
 	desc.componentFlags = 0;
 	desc.componentFlagsMask = 0;
 	comp = AudioComponentFindNext(NULL, &desc);
+
 	if(comp == NULL) {
 		error("FindNextComponent failed");
 		return(-1);
@@ -163,6 +304,13 @@ static int open_coreaudio(audio_output_t *ao)
 	if(AudioUnitSetProperty(ca->outputUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &outFormat, size)) {
 		error("AudioUnitSetProperty(kAudioUnitProperty_StreamFormat) failed");
 		return (-1);
+	}
+
+	if (deviceID != kAudioObjectUnknown) {
+		if (AudioUnitSetProperty(ca->outputUnit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &deviceID, sizeof(deviceID))) {
+			error("AudioUnitSetProperty(kAudioOutputUnitProperty_CurrentDevice) failed");
+			return -1;
+		}
 	}
 
 	/* Specify the input PCM format */
